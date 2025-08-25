@@ -1,0 +1,173 @@
+import pandas as pd
+import numpy as np
+from scipy.stats import norm
+
+# ---------------------------
+# User-editable parameters
+# ---------------------------
+FILE = "Inventory_mastersheet.xlsx"            # put file in same folder
+SERVICE_LEVEL = 0.95
+Z = norm.ppf(SERVICE_LEVEL)
+AGG_PERIOD = "W"           # "W" for weekly aggregation, "D" for daily (use "W" recommended)
+REVIEW_WEEKS = 2.0         # used to create S if avg_po missing; larger -> fewer orders
+MINIMIZE_ORDERS = True    # if True choose larger S (within shelf-life) to reduce #orders
+OUTPUT = "Ss_policy_final.xlsx"
+
+# ---------------------------
+# Read Excel sheets
+# ---------------------------
+xls = pd.ExcelFile(FILE)
+candidates = [s for s in xls.sheet_names if "stl" in s.lower() or "sales" in s.lower()]
+if not candidates:
+    raise SystemExit("No sales-like sheet found in workbook. Put sheet with name containing 'STL' or 'sales'.")
+sales_sheet = candidates[0]   # pick first matching sheet
+print("Using sales sheet:", sales_sheet)
+
+sales = pd.read_excel(FILE, sheet_name=sales_sheet)
+sku_master = pd.read_excel(FILE, sheet_name="SKU_master")
+
+if "Purchase_orders_cleaned" in xls.sheet_names:
+    po = pd.read_excel(FILE, sheet_name="Purchase_orders_cleaned")
+else:
+    po = None
+
+# ---------------------------
+# Normalize sales sheet: long format expected (date, sku_id, quantity_sold)
+# ---------------------------
+sales_cols = [c.lower() for c in sales.columns]
+if ("sku_id" in sales_cols) and ("quantity_sold" in sales_cols) and ("date" in sales_cols):
+    sales = sales.rename(columns={c: c.lower() for c in sales.columns})
+else:
+    date_col = next((c for c in sales.columns if "date" in c.lower()), None)
+    if date_col is None:
+        raise SystemExit("Could not find a date column in sales sheet. Rename date column to include 'date'.")
+    id_vars = [date_col]
+    value_vars = [c for c in sales.columns if c not in id_vars]
+    sales = sales.melt(id_vars=id_vars, value_vars=value_vars, var_name="sku_id", value_name="quantity_sold")
+    sales.columns = [c.lower() for c in sales.columns]
+
+required = ["date","sku_id","quantity_sold"]
+for c in required:
+    if c not in sales.columns:
+        raise SystemExit(f"Required column '{c}' not found in sales after normalization. Current cols: {list(sales.columns)}")
+
+# ---------------------------
+# Aggregate to weekly or daily demand
+# ---------------------------
+sales["date"] = pd.to_datetime(sales["date"], errors="coerce")
+if AGG_PERIOD.upper() == "W":
+    sales["period_start"] = sales["date"].dt.to_period("W").apply(lambda r: r.start_time)
+else:
+    sales["period_start"] = sales["date"].dt.to_period("D").apply(lambda r: r.start_time)
+
+weekly = sales.groupby(["sku_id","period_start"], as_index=False)["quantity_sold"].sum()
+
+# ---------------------------
+# Demand stats per SKU
+# ---------------------------
+demand_stats = weekly.groupby("sku_id").agg(
+    weeks_observed = ("quantity_sold","count"),
+    total_period_demand = ("quantity_sold","sum"),
+    mu = ("quantity_sold","mean"),
+    sigma = ("quantity_sold","std")
+).reset_index()
+demand_stats["sigma"] = demand_stats["sigma"].fillna(0.0)
+
+# ---------------------------
+# Merge SKU master (contains delay_rate)
+# ---------------------------
+sku_master = sku_master.rename(columns={c:c.lower() for c in sku_master.columns})
+if "sku_id" not in sku_master.columns:
+    raise SystemExit("SKU_master must have column 'sku_id'.")
+if "avg_lead_time" not in sku_master.columns or "shelf_life_days" not in sku_master.columns:
+    raise SystemExit("SKU_master must have 'avg_lead_time' and 'shelf_life_days' columns.")
+if "delay_rate" not in sku_master.columns:
+    print("Warning: SKU_master does not have 'delay_rate'. Setting all to 0.")
+    sku_master["delay_rate"] = 0.0
+
+df = pd.merge(demand_stats, sku_master, on="sku_id", how="left")
+
+# ---------------------------
+# avg PO qty if present
+# ---------------------------
+if po is not None:
+    po = po.rename(columns={c:c.lower() for c in po.columns})
+    if "sku_id" in po.columns and "quantity_ordered" in po.columns:
+        po_stats = po.groupby("sku_id").quantity_ordered.mean().reset_index().rename(columns={"quantity_ordered":"avg_po_qty"})
+        df = df.merge(po_stats, on="sku_id", how="left")
+    else:
+        df["avg_po_qty"] = np.nan
+else:
+    df["avg_po_qty"] = np.nan
+
+# ---------------------------
+# Ensure numeric values
+# ---------------------------
+for col in ["avg_lead_time","shelf_life_days","mu","sigma","delay_rate"]:
+    df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+
+# Convert to weeks
+df["lead_weeks"] = df["avg_lead_time"] / 7.0
+df["shelf_weeks"] = df["shelf_life_days"] / 7.0
+
+# Effective lead time
+df["L_eff"] = df["lead_weeks"] * (1.0 + df["delay_rate"])
+
+# Demand during lead time and variability
+df["mu_LT"] = df["mu"] * df["L_eff"]
+df["sigma_LT"] = df["sigma"] * np.sqrt(df["L_eff"])
+
+# Safety stock and reorder point
+df["safety_stock"] = Z * df["sigma_LT"]
+df["s_reorder"] = df["mu_LT"] + df["safety_stock"]
+
+# Candidate S values
+df["S_from_avgpo"] = df["s_reorder"] + df["avg_po_qty"].fillna(0.0)
+df["S_from_review"] = df["s_reorder"] + df["mu"] * REVIEW_WEEKS
+df["S_candidate"] = df[["S_from_avgpo","S_from_review"]].max(axis=1)
+df["S_shelf_cap"] = df["mu"] * df["shelf_weeks"]
+
+# Final S: respect shelf-life cap
+if MINIMIZE_ORDERS:
+    df["S_final"] = df[["S_candidate","S_shelf_cap"]].min(axis=1)
+else:
+    df["S_final"] = df[["S_from_review","S_shelf_cap"]].min(axis=1)
+
+# Order quantity
+df["order_quantity"] = df["S_final"] - df["s_reorder"]
+df["order_quantity"] = df["order_quantity"].apply(lambda x: x if x>0 else np.nan)
+
+# Estimated orders per year
+df["annual_demand"] = df["mu"] * (52 if AGG_PERIOD.upper()=="W" else 365)
+df["est_orders_per_year"] = df.apply(lambda r: (r["annual_demand"]/r["order_quantity"]) if pd.notna(r["order_quantity"]) and r["order_quantity"]>0 else np.nan, axis=1)
+
+# Flags
+df["small_sample_warning"] = df["weeks_observed"] < 4
+df["zero_sigma_warning"] = df["sigma"] == 0
+
+# ---------------------------
+# Output and save
+# ---------------------------
+out_cols = [
+    "sku_id","weeks_observed","total_period_demand","mu","sigma",
+    "avg_lead_time","lead_weeks","delay_rate","L_eff",
+    "shelf_life_days","shelf_weeks",
+    "mu_LT","sigma_LT","safety_stock","s_reorder",
+    "S_from_avgpo","S_from_review","S_candidate","S_shelf_cap","S_final",
+    "order_quantity","annual_demand","est_orders_per_year",
+    "small_sample_warning","zero_sigma_warning"
+]
+out_cols = [c for c in out_cols if c in df.columns]
+out = df[out_cols].copy()
+
+out.to_excel(OUTPUT, index=False)
+print(f"Saved results to {OUTPUT}")
+
+print("\nSample output (first rows):")
+print(out.head(6).to_string(index=False))
+
+print("\nNotes / Tips:")
+print("- s_reorder = demand during lead time + safety stock")
+print("- S_final chosen to reduce order frequency but capped by shelf-life")
+print("- order_quantity = S_final - s_reorder")
+print("- Delay rates are now read directly from SKU_master")

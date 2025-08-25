@@ -1,0 +1,84 @@
+import pandas as pd
+import numpy as np
+from scipy.stats import norm
+
+# -----------------------------
+# Step 1: Load Excel sheets
+# -----------------------------
+file_path = "Inventory_mastersheet.xlsx"   # <-- put your file in same folder
+
+sales_data = pd.read_excel(file_path, sheet_name="STL_better_cleaned")
+sku_master = pd.read_excel(file_path, sheet_name="SKU_master")
+
+
+manual_delay_rates = {
+    "P1001": 0.11,
+    "P1002": 0.05,
+    "P1003": 0.11,
+    "P1004": 0.22,
+    "P1005": 0.09,
+    "P1006": 0.08,
+    "P1007": 0.06,
+    "P1008": 0.06,
+    "P1009": 0.20,
+    "P1010": 0.23
+}
+
+# -----------------------------
+# Step 2: Compute demand stats
+# -----------------------------
+# Group sales by sku_id
+demand_stats = sales_data.groupby("sku_id").agg(
+    avg_demand=("quantity_sold", "mean"),
+    std_demand=("quantity_sold", "std")
+).reset_index()
+
+# Merge with master sheet
+df = pd.merge(demand_stats, sku_master, on="sku_id", how="left")
+
+# -----------------------------
+# Step 3: Define service level
+# -----------------------------
+service_level = 0.95
+z = norm.ppf(service_level)   # safety factor
+
+# -----------------------------
+# Step 4: Compute (s, S) policy
+# -----------------------------
+results = []
+for _, row in df.iterrows():
+    sku_id = row["sku_id"]
+    mu = row["avg_demand"]
+    sigma = row["std_demand"] if not np.isnan(row["std_demand"]) else 0
+    lead_time = row["avg_lead_time"]
+    shelf_life = row["shelf_life_days"]
+    delay_rate = manual_delay_rates.get(row["sku_id"], 0)
+
+    # Adjust lead time for delays
+    effective_lead_time = lead_time * (1 + delay_rate)
+
+    # Shelf-life constraint: can’t order more than what can be sold before expiry
+    max_cycle_demand = mu * shelf_life
+
+    # Safety stock
+    safety_stock = z * sigma * np.sqrt(effective_lead_time)
+
+    # Reorder point (s)
+    s = mu * effective_lead_time  
+
+    # Base stock (S)
+    S = s + safety_stock
+    S = min(S, max_cycle_demand)
+
+    # Order quantity (example: EOQ-like heuristic, capped by shelf life)
+    order_quantity = min(max_cycle_demand, mu * (shelf_life / 2))
+
+    results.append([sku_id, round(s, 2), round(S, 2), round(order_quantity, 2)])
+
+# -----------------------------
+# Step 5: Save results
+# -----------------------------
+results_df = pd.DataFrame(results, columns=["sku_id", "s", "S", "order_quantity"])
+results_df.to_excel("Ss_policy_results.xlsx", index=False)
+
+print("Computation complete. Results saved to 'Ss_policy_results.xlsx'")

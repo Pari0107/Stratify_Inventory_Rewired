@@ -1,0 +1,125 @@
+import pandas as pd
+from math import ceil
+
+file_path = "Model_results.xlsx"
+
+inventory_df = pd.read_excel(file_path, sheet_name="inventory_data")
+ss_params_df = pd.read_excel(file_path, sheet_name="Ss_relevant_data")
+sku_master_df = pd.read_excel(file_path, sheet_name="SKU_master")
+demand_df = pd.read_excel(file_path, sheet_name="formatted_3_week_comparison_dat")
+demand_df["date"] = pd.to_datetime(demand_df["date"])
+
+ss_full_df = pd.merge(ss_params_df, sku_master_df[["sku_id", "avg_lead_time", "delay_rate"]], on="sku_id", how="left")
+ss_full_df["lead_time_days"] = (ss_full_df["avg_lead_time"] * (1 + ss_full_df["delay_rate"])).apply(ceil)
+
+demand_full_df = pd.merge(demand_df,
+                          ss_full_df[["sku_id", "s_reorder", "S_final", "lead_time_days"]],
+                          on="sku_id",
+                          how="left")
+
+inventory = {(row["store_id"], row["sku_id"]): row["current_stock"] for _, row in inventory_df.iterrows()}
+
+pending_orders = []
+stockouts = []
+purchase_orders = []
+daily_inventory_records = []
+
+dates = sorted(demand_full_df["date"].unique())
+stores = ["S001", "S002", "S003"]
+
+def distribute_to_equalize(inv_dict, sku_id, total_qty):
+    inv_items = [(store, inv_dict.get((store, sku_id), 0)) for store in stores]
+    inv_items.sort(key=lambda x: x[1])
+    allocations = {store: 0 for store, _ in inv_items}
+    for _ in range(total_qty):
+        inv_items.sort(key=lambda x: x[1] + allocations[x[0]])
+        store_to_add = inv_items[0][0]
+        allocations[store_to_add] += 1
+    return allocations
+
+for current_date in dates:
+    # Process deliveries arriving today and update inventory
+    arrivals_today = [order for order in pending_orders if order["delivery_date"] == current_date]
+    for order in arrivals_today:
+        allocs = distribute_to_equalize(inventory, order["sku_id"], order["qty"])
+        for store, qty in allocs.items():
+            key = (store, order["sku_id"])
+            inventory[key] = inventory.get(key, 0) + qty
+        # Mark delivery in purchase orders
+        for po in purchase_orders:
+            if (po.get("sku_id") == order["sku_id"] and po.get("delivery_date") == current_date
+                and po.get("order_qty") == order["qty"]):
+                po["distribution"] = allocs
+    # Remove delivered orders
+    pending_orders = [order for order in pending_orders if order["delivery_date"] > current_date]
+
+    day_data = demand_full_df[demand_full_df["date"] == current_date]
+
+    # Process daily demand & stockouts per store
+    for _, row in day_data.iterrows():
+        key = (row["store_id"], row["sku_id"])
+        demand_qty = row["quantity_sold"]
+        current_inv = inventory.get(key, 0)
+
+        if demand_qty <= current_inv:
+            inventory[key] = current_inv - demand_qty
+        else:
+            stockout_qty = demand_qty - current_inv
+            inventory[key] = 0
+            stockouts.append({"date": current_date, "store_id": row["store_id"], "sku_id": row["sku_id"], "stockout_qty": stockout_qty})
+
+    # Check cumulative inventory per SKU and place order if needed,
+    # assigning distribution immediately on order placement as empty dict temporarily
+    for sku in day_data["sku_id"].unique():
+        total_inventory = sum(inventory.get((store, sku), 0) for store in stores)
+
+        sku_row = ss_full_df[ss_full_df["sku_id"] == sku].iloc[0]
+        s_threshold = sku_row["s_reorder"]
+        S_level = sku_row["S_final"]
+        lead_time_days = sku_row["lead_time_days"]
+
+        already_ordered = any(order["sku_id"] == sku for order in pending_orders)
+
+        if total_inventory <= s_threshold and not already_ordered:
+            order_qty = int(max(0, S_level - total_inventory))
+            if order_qty > 0:
+                delivery_date = current_date + pd.Timedelta(days=lead_time_days)
+                pending_orders.append({"sku_id": sku, "delivery_date": delivery_date, "qty": order_qty})
+                # Assign distribution eagerly on order placement (will be updated on delivery to actual allocation)
+                initial_alloc = distribute_to_equalize(inventory, sku, order_qty)
+                purchase_orders.append({
+                    "order_date": current_date,
+                    "sku_id": sku,
+                    "order_qty": order_qty,
+                    "delivery_date": delivery_date,
+                    "distribution": initial_alloc  # initial guess, updated upon delivery
+                })
+
+    # Record daily inventory snapshot
+    for store in stores:
+        for sku in day_data["sku_id"].unique():
+            qty = inventory.get((store, sku), 0)
+            daily_inventory_records.append({
+                "date": current_date,
+                "store_id": store,
+                "sku_id": sku,
+                "inventory_qty": qty
+            })
+
+stockouts_df = pd.DataFrame(stockouts)
+purchase_orders_df = pd.DataFrame(purchase_orders)
+daily_inventory_df = pd.DataFrame(daily_inventory_records)
+
+# Expand distribution dict to separate columns for stores
+dist_expanded = purchase_orders_df['distribution'].apply(pd.Series).rename(columns=lambda c: f"{c}_distributed")
+purchase_orders_df = pd.concat([purchase_orders_df.drop(columns=['distribution']), dist_expanded], axis=1)
+
+# Save output files
+stockouts_df.to_excel("stockouts_full_report.xlsx", index=False)
+purchase_orders_df.to_excel("purchase_orders_full_report_expanded_distribution.xlsx", index=False)
+daily_inventory_df.to_excel("daily_inventory_report.xlsx", index=False)
+
+print("Simulation complete with non-empty purchase distribution and detailed tracking.")
+print(f"Total stockout events: {len(stockouts_df)}")
+print(f"Total purchase orders placed: {len(purchase_orders_df)}")
+print(f"Total daily inventory records: {len(daily_inventory_df)}")
